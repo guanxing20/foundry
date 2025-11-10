@@ -1,5 +1,6 @@
 use crate::{
     Cast, SimpleCast,
+    cmd::erc20::IERC20,
     opts::{Cast as CastArgs, CastSubcommand, ToBaseArgs},
     traces::identifier::SignaturesIdentifier,
 };
@@ -13,10 +14,10 @@ use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use eyre::Result;
-use foundry_cli::{handler, utils, utils::LoadConfig};
+use foundry_cli::{utils, utils::LoadConfig};
 use foundry_common::{
     abi::{get_error, get_event},
-    fmt::{format_tokens, format_tokens_raw, format_uint_exp},
+    fmt::{format_tokens, format_uint_exp, serialize_value_as_json},
     fs,
     selectors::{
         ParsedSignatures, SelectorImportData, SelectorKind, decode_calldata, decode_event_topic,
@@ -38,11 +39,8 @@ pub fn run() -> Result<()> {
 
 /// Setup the global logger and other utilities.
 pub fn setup() -> Result<()> {
-    utils::install_crypto_provider();
-    handler::install();
-    utils::load_dotenv();
+    utils::common_setup();
     utils::subscriber();
-    utils::enable_paint();
 
     Ok(())
 }
@@ -194,6 +192,15 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 sh_println!("{}", SimpleCast::abi_encode_packed(&sig, &args)?)?
             }
         }
+        CastSubcommand::AbiEncodeEvent { sig, args } => {
+            let log_data = SimpleCast::abi_encode_event(&sig, &args)?;
+            for (i, topic) in log_data.topics().iter().enumerate() {
+                sh_println!("[topic{}]: {}", i, topic)?;
+            }
+            if !log_data.data.is_empty() {
+                sh_println!("[data]: {}", hex::encode_prefixed(log_data.data))?;
+            }
+        }
         CastSubcommand::DecodeCalldata { sig, calldata, file } => {
             let raw_hex = if let Some(file_path) = file {
                 let contents = fs::read_to_string(&file_path)?;
@@ -228,7 +235,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 let event = get_event(event_sig.as_str())?;
                 event.decode_log_parts(core::iter::once(event.selector()), &hex::decode(data)?)?
             } else {
-                let data = data.strip_prefix("0x").unwrap_or(data.as_str());
+                let data = crate::strip_0x(&data);
                 let selector = data.get(..64).unwrap_or_default();
                 let selector = selector.parse()?;
                 let identified_event =
@@ -248,7 +255,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let error = if let Some(err_sig) = sig {
                 get_error(err_sig.as_str())?
             } else {
-                let data = data.strip_prefix("0x").unwrap_or(data.as_str());
+                let data = crate::strip_0x(&data);
                 let selector = data.get(..8).unwrap_or_default();
                 let identified_error =
                     SignaturesIdentifier::new(false)?.identify_error(selector.parse()?).await;
@@ -267,6 +274,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::ConstructorArgs(cmd) => cmd.run().await?,
         CastSubcommand::Artifact(cmd) => cmd.run().await?,
         CastSubcommand::Bind(cmd) => cmd.run().await?,
+        CastSubcommand::B2EPayload(cmd) => cmd.run().await?,
         CastSubcommand::PrettyCalldata { calldata, offline } => {
             let calldata = stdin::unwrap_line(calldata)?;
             sh_println!("{}", pretty_calldata(&calldata, offline).await?)?;
@@ -303,8 +311,13 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
 
             match erc20 {
                 Some(token) => {
-                    let balance =
-                        Cast::new(&provider).erc20_balance(token, account_addr, block).await?;
+                    let balance = IERC20::new(token, &provider)
+                        .balanceOf(account_addr)
+                        .block(block.unwrap_or_default())
+                        .call()
+                        .await?;
+
+                    sh_warn!("--erc20 flag is deprecated, use `cast erc20 balance` instead")?;
                     sh_println!("{}", format_uint_exp(balance))?
                 }
                 None => {
@@ -723,12 +736,6 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::Completions { shell } => {
             generate(shell, &mut CastArgs::command(), "cast", &mut std::io::stdout())
         }
-        CastSubcommand::GenerateFigSpec => clap_complete::generate(
-            clap_complete_fig::Fig,
-            &mut CastArgs::command(),
-            "cast",
-            &mut std::io::stdout(),
-        ),
         CastSubcommand::Logs(cmd) => cmd.run().await?,
         CastSubcommand::DecodeTransaction { tx } => {
             let tx = stdin::unwrap_line(tx)?;
@@ -742,22 +749,28 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             }
         }
         CastSubcommand::RecoverAuthority { auth } => {
-            let auth: SignedAuthorization = serde_json::from_str(&auth).unwrap();
+            let auth: SignedAuthorization = serde_json::from_str(&auth)?;
             sh_println!("{}", auth.recover_authority()?)?;
         }
         CastSubcommand::TxPool { command } => command.run().await?,
+        CastSubcommand::Erc20Token { command } => command.run().await?,
         CastSubcommand::DAEstimate(cmd) => {
             cmd.run().await?;
         }
     };
 
-    /// Prints slice of tokens using [`format_tokens`] or [`format_tokens_raw`] depending whether
-    /// the shell is in JSON mode.
+    /// Prints slice of tokens using [`format_tokens`] or [`serialize_value_as_json`] depending
+    /// whether the shell is in JSON mode.
     ///
     /// This is included here to avoid a cyclic dependency between `fmt` and `common`.
     fn print_tokens(tokens: &[DynSolValue]) {
         if shell::is_json() {
-            let tokens: Vec<String> = format_tokens_raw(tokens).collect();
+            let tokens: Vec<serde_json::Value> = tokens
+                .iter()
+                .cloned()
+                .map(|t| serialize_value_as_json(t, None))
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
             let _ = sh_println!("{}", serde_json::to_string_pretty(&tokens).unwrap());
         } else {
             let tokens = format_tokens(tokens);

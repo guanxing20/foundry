@@ -9,19 +9,23 @@ use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English
 use alloy_signer_trezor::{HDPath as TrezorHDPath, TrezorSigner};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
+use tracing::warn;
 
 #[cfg(feature = "aws-kms")]
-use {alloy_signer_aws::AwsSigner, aws_config::BehaviorVersion, aws_sdk_kms::Client as AwsClient};
+use alloy_signer_aws::{AwsSigner, aws_config::BehaviorVersion, aws_sdk_kms::Client as AwsClient};
 
 #[cfg(feature = "gcp-kms")]
-use {
-    alloy_signer_gcp::{GcpKeyRingRef, GcpSigner, GcpSignerError, KeySpecifier},
+use alloy_signer_gcp::{
+    GcpKeyRingRef, GcpSigner, GcpSignerError, KeySpecifier,
     gcloud_sdk::{
         GoogleApi,
         google::cloud::kms::v1::key_management_service_client::KeyManagementServiceClient,
     },
 };
+
+#[cfg(feature = "turnkey")]
+use alloy_signer_turnkey::TurnkeySigner;
 
 pub type Result<T> = std::result::Result<T, WalletSignerError>;
 
@@ -40,6 +44,9 @@ pub enum WalletSigner {
     /// Wrapper around Google Cloud KMS signer.
     #[cfg(feature = "gcp-kms")]
     Gcp(GcpSigner),
+    /// Wrapper around Turnkey signer.
+    #[cfg(feature = "turnkey")]
+    Turnkey(TurnkeySigner),
 }
 
 impl WalletSigner {
@@ -56,10 +63,15 @@ impl WalletSigner {
     pub async fn from_aws(key_id: String) -> Result<Self> {
         #[cfg(feature = "aws-kms")]
         {
-            let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+            let config =
+                alloy_signer_aws::aws_config::load_defaults(BehaviorVersion::latest()).await;
             let client = AwsClient::new(&config);
 
-            Ok(Self::Aws(AwsSigner::new(client, key_id, None).await?))
+            Ok(Self::Aws(
+                AwsSigner::new(client, key_id, None)
+                    .await
+                    .map_err(|e| WalletSignerError::Aws(Box::new(e)))?,
+            ))
         }
 
         #[cfg(not(feature = "aws-kms"))]
@@ -87,12 +99,20 @@ impl WalletSigner {
             .await
             {
                 Ok(c) => c,
-                Err(e) => return Err(WalletSignerError::from(GcpSignerError::GoogleKmsError(e))),
+                Err(e) => {
+                    return Err(WalletSignerError::Gcp(Box::new(GcpSignerError::GoogleKmsError(
+                        e,
+                    ))));
+                }
             };
 
             let specifier = KeySpecifier::new(keyring, &key_name, key_version);
 
-            Ok(Self::Gcp(GcpSigner::new(client, specifier, None).await?))
+            Ok(Self::Gcp(
+                GcpSigner::new(client, specifier, None)
+                    .await
+                    .map_err(|e| WalletSignerError::Gcp(Box::new(e)))?,
+            ))
         }
 
         #[cfg(not(feature = "gcp-kms"))]
@@ -106,6 +126,30 @@ impl WalletSigner {
         }
     }
 
+    pub fn from_turnkey(
+        api_private_key: String,
+        organization_id: String,
+        address: Address,
+    ) -> Result<Self> {
+        #[cfg(feature = "turnkey")]
+        {
+            Ok(Self::Turnkey(TurnkeySigner::from_api_key(
+                &api_private_key,
+                organization_id,
+                address,
+                None,
+            )?))
+        }
+
+        #[cfg(not(feature = "turnkey"))]
+        {
+            let _ = api_private_key;
+            let _ = organization_id;
+            let _ = address;
+            Err(WalletSignerError::UnsupportedSigner("Turnkey"))
+        }
+    }
+
     pub fn from_private_key(private_key: &B256) -> Result<Self> {
         Ok(Self::Local(PrivateKeySigner::from_bytes(private_key)?))
     }
@@ -116,47 +160,65 @@ impl WalletSigner {
     /// - the result for Ledger signers includes addresses available for both LedgerLive and Legacy
     ///   derivation paths
     /// - for Local and AWS signers the result contains a single address
+    /// - errors when retrieving addresses are logged but do not prevent returning available
+    ///   addresses
     pub async fn available_senders(&self, max: usize) -> Result<Vec<Address>> {
-        let mut senders = Vec::new();
+        let mut senders = HashSet::new();
+
         match self {
             Self::Local(local) => {
-                senders.push(local.address());
+                senders.insert(local.address());
             }
             Self::Ledger(ledger) => {
+                // Try LedgerLive derivation path
                 for i in 0..max {
-                    if let Ok(address) =
-                        ledger.get_address_with_path(&LedgerHDPath::LedgerLive(i)).await
-                    {
-                        senders.push(address);
+                    match ledger.get_address_with_path(&LedgerHDPath::LedgerLive(i)).await {
+                        Ok(address) => {
+                            senders.insert(address);
+                        }
+                        Err(e) => {
+                            warn!("Failed to get Ledger address at index {i} (LedgerLive): {e}");
+                        }
                     }
                 }
+                // Try Legacy derivation path
                 for i in 0..max {
-                    if let Ok(address) =
-                        ledger.get_address_with_path(&LedgerHDPath::Legacy(i)).await
-                    {
-                        senders.push(address);
+                    match ledger.get_address_with_path(&LedgerHDPath::Legacy(i)).await {
+                        Ok(address) => {
+                            senders.insert(address);
+                        }
+                        Err(e) => {
+                            warn!("Failed to get Ledger address at index {i} (Legacy): {e}");
+                        }
                     }
                 }
             }
             Self::Trezor(trezor) => {
                 for i in 0..max {
-                    if let Ok(address) =
-                        trezor.get_address_with_path(&TrezorHDPath::TrezorLive(i)).await
-                    {
-                        senders.push(address);
+                    match trezor.get_address_with_path(&TrezorHDPath::TrezorLive(i)).await {
+                        Ok(address) => {
+                            senders.insert(address);
+                        }
+                        Err(e) => {
+                            warn!("Failed to get Trezor address at index {i} (TrezorLive): {e}",);
+                        }
                     }
                 }
             }
             #[cfg(feature = "aws-kms")]
             Self::Aws(aws) => {
-                senders.push(alloy_signer::Signer::address(aws));
+                senders.insert(alloy_signer::Signer::address(aws));
             }
             #[cfg(feature = "gcp-kms")]
             Self::Gcp(gcp) => {
-                senders.push(alloy_signer::Signer::address(gcp));
+                senders.insert(alloy_signer::Signer::address(gcp));
+            }
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey(turnkey) => {
+                senders.insert(alloy_signer::Signer::address(turnkey));
             }
         }
-        Ok(senders)
+        Ok(senders.into_iter().collect())
     }
 
     pub fn from_mnemonic(
@@ -191,6 +253,8 @@ macro_rules! delegate {
             Self::Aws($inner) => $e,
             #[cfg(feature = "gcp-kms")]
             Self::Gcp($inner) => $e,
+            #[cfg(feature = "turnkey")]
+            Self::Turnkey($inner) => $e,
         }
     };
 }

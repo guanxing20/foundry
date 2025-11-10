@@ -1,14 +1,16 @@
 use super::UnwrappedModifierLogic;
 use crate::{
-    linter::{LateLintPass, LintContext, Snippet},
+    linter::{LateLintPass, LintContext, Suggestion},
     sol::{Severity, SolLint},
 };
-use solar_ast::{self as ast, Span};
-use solar_sema::hir::{self, Res};
+use solar::{
+    ast,
+    sema::hir::{self, Res},
+};
 
 declare_forge_lint!(
     UNWRAPPED_MODIFIER_LOGIC,
-    Severity::Gas,
+    Severity::CodeSize,
     "unwrapped-modifier-logic",
     "wrap modifier logic to reduce code size"
 );
@@ -16,13 +18,13 @@ declare_forge_lint!(
 impl<'hir> LateLintPass<'hir> for UnwrappedModifierLogic {
     fn check_function(
         &mut self,
-        ctx: &LintContext<'_>,
+        ctx: &LintContext,
         hir: &'hir hir::Hir<'hir>,
         func: &'hir hir::Function<'hir>,
     ) {
         // Only check modifiers with a body and a name
-        let (body, name) = match (func.kind, &func.body, func.name) {
-            (ast::FunctionKind::Modifier, Some(body), Some(name)) => (body, name),
+        let body = match (func.kind, &func.body, func.name) {
+            (ast::FunctionKind::Modifier, Some(body), Some(_)) => body,
             _ => return,
         };
 
@@ -33,9 +35,13 @@ impl<'hir> LateLintPass<'hir> for UnwrappedModifierLogic {
             .position(|s| matches!(s.kind, hir::StmtKind::Placeholder))
             .map_or((stmts, &[][..]), |idx| (&stmts[..idx], &stmts[idx + 1..]));
 
-        // Generate a fix snippet if the modifier logic should be wrapped.
-        if let Some(snippet) = self.get_snippet(ctx, hir, func, before, after) {
-            ctx.emit_with_fix(&UNWRAPPED_MODIFIER_LOGIC, name.span, snippet);
+        // Generate a fix suggestion if the modifier logic should be wrapped.
+        if let Some(suggestion) = self.get_snippet(ctx, hir, func, before, after) {
+            ctx.emit_with_suggestion(
+                &UNWRAPPED_MODIFIER_LOGIC,
+                func.span.to(func.body_span),
+                suggestion,
+            );
         }
     }
 }
@@ -92,12 +98,12 @@ impl UnwrappedModifierLogic {
 
     fn get_snippet<'a>(
         &self,
-        ctx: &LintContext<'_>,
+        ctx: &LintContext,
         hir: &hir::Hir<'_>,
         func: &hir::Function<'_>,
         before: &'a [hir::Stmt<'a>],
         after: &'a [hir::Stmt<'a>],
-    ) -> Option<Snippet> {
+    ) -> Option<Suggestion> {
         let wrap_before = !before.is_empty() && self.stmts_require_wrapping(hir, before);
         let wrap_after = !after.is_empty() && self.stmts_require_wrapping(hir, after);
 
@@ -143,9 +149,8 @@ impl UnwrappedModifierLogic {
         };
 
         let mod_indent = " ".repeat(ctx.get_span_indentation(func.span));
-        let mut replacement = format!(
-            "{mod_indent}modifier {modifier_name}({param_decls}) {{\n{body}\n{mod_indent}}}"
-        );
+        let mut replacement =
+            format!("modifier {modifier_name}({param_decls}) {{\n{body}\n{mod_indent}}}");
 
         let build_func = |stmts: &[hir::Stmt<'_>], suffix: &str| {
             let body_stmts = stmts
@@ -165,11 +170,12 @@ impl UnwrappedModifierLogic {
             replacement.push_str(&build_func(after, if wrap_before { "After" } else { "" }));
         }
 
-        Some(Snippet::Diff {
-            desc: Some("wrap modifier logic to reduce code size"),
-            span: Some(Span::new(func.span.lo(), func.body_span.hi())),
-            add: replacement,
-            trim_code: true,
-        })
+        Some(
+            Suggestion::fix(
+                replacement,
+                ast::interface::diagnostics::Applicability::MachineApplicable,
+            )
+            .with_desc("wrap modifier logic to reduce code size"),
+        )
     }
 }
